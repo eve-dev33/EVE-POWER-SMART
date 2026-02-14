@@ -42,6 +42,8 @@ static const uint8_t PWR_CMD_TYPE       = 10;
 static const uint8_t PWR_STATE_TYPE     = 12;
 static const uint8_t PWR_TIME_TYPE      = 13; // minute-only
 static const uint8_t PWR_RELAYRULE_TYPE = 14; // rules per relay
+static const uint8_t PWR_SCHED_ACK_TYPE = 15; // rules saved by slave
+static const uint8_t PWR_EXECUTED_TYPE  = 16; // scheduled action executed
 
 typedef struct __attribute__((packed)) {
   uint8_t type;     // 10
@@ -80,6 +82,23 @@ typedef struct __attribute__((packed)) {
   uint8_t valid;        // 0/1
   uint32_t ms;
 } PowerTimePacket;
+
+typedef struct __attribute__((packed)) {
+  uint8_t type;      // 15
+  uint8_t ch;        // 1..4
+  uint8_t ok;        // 1 = saved
+  uint8_t count;     // 0..10
+  uint32_t ms;
+} PowerScheduleAckPacket;
+
+typedef struct __attribute__((packed)) {
+  uint8_t type;         // 16
+  uint8_t ch;           // 1..4
+  uint8_t state;        // 1=ON 0=OFF
+  uint16_t minuteOfDay; // execution minute
+  uint8_t weekdayMon0;  // execution weekday (0=lun..6=dom)
+  uint32_t ms;
+} PowerExecutedPacket;
 
 // ===================== ESPNOW =====================
 // master MAC learned automatically
@@ -179,10 +198,39 @@ static void sendStateToMaster() {
   esp_now_send(MASTER_MAC, (uint8_t*)&st, sizeof(st));
 }
 
+static void sendScheduleAckToMaster(uint8_t ch1to4, uint8_t count, bool ok = true) {
+  if (!masterMacValid()) return;
+  if (ch1to4 < 1 || ch1to4 > 4) return;
+
+  PowerScheduleAckPacket ack;
+  ack.type = PWR_SCHED_ACK_TYPE;
+  ack.ch = ch1to4;
+  ack.ok = ok ? 1 : 0;
+  ack.count = (count > 10) ? 10 : count;
+  ack.ms = millis();
+
+  esp_now_send(MASTER_MAC, (uint8_t*)&ack, sizeof(ack));
+}
+
+static void sendExecutedToMaster(uint8_t ch1to4, bool on) {
+  if (!masterMacValid()) return;
+  if (ch1to4 < 1 || ch1to4 > 4) return;
+
+  PowerExecutedPacket ex;
+  ex.type = PWR_EXECUTED_TYPE;
+  ex.ch = ch1to4;
+  ex.state = on ? 1 : 0;
+  ex.minuteOfDay = curMinOfDay;
+  ex.weekdayMon0 = curWeekday;
+  ex.ms = millis();
+
+  esp_now_send(MASTER_MAC, (uint8_t*)&ex, sizeof(ex));
+}
+
 // ===================== APPLY RULES (exact minute + normalize) =====================
 
 // apply rules that match EXACTLY current minute (last wins due to iteration order)
-static bool applyRulesExactNow() {
+static bool applyRulesExactNow(bool notifyExecuted) {
   if (!timeValid) return false;
 
   bool changed = false;
@@ -200,6 +248,7 @@ static bool applyRulesExactNow() {
         if (relayMaskGet(ch) != desired) {
           relayWrite(ch, desired);
           relayMaskSet(ch, desired);
+          if (notifyExecuted) sendExecutedToMaster(ch, desired);
           changed = true;
         }
       }
@@ -335,6 +384,7 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
     ruleCount[idx] = c;
 
     saveRules(rp.ch);
+    sendScheduleAckToMaster(rp.ch, ruleCount[idx], true);
 
     // IMPORTANT: after schedule update, normalize NOW
     bool changed = normalizeAllRelaysNow();
@@ -357,7 +407,7 @@ void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len)
       lastTimeSyncMs = millis();
 
       // FIX: apply rules immediately on time sync
-      bool changed1 = applyRulesExactNow();
+      bool changed1 = applyRulesExactNow(false);
       bool changed2 = normalizeAllRelaysNow();
       (void)changed1; (void)changed2;
     }
@@ -466,7 +516,7 @@ void loop() {
       curWeekday  = (curWeekday + (total / 1440UL)) % 7;
       curMinOfDay = total % 1440UL;
 
-      bool changed1 = applyRulesExactNow();
+      bool changed1 = applyRulesExactNow(true);
       bool changed2 = normalizeAllRelaysNow();
       if (changed1 || changed2) sendStateToMaster();
     }
