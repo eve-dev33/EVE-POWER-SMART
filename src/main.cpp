@@ -293,20 +293,27 @@ static inline bool dayEnabled(uint8_t daysMask, uint8_t wdMon0) {
 }
 
 // ===================== NVS rules =====================
+/*Salva in memoria permanente (NVS) tutte le regole di un relè specifico
+e ritorna true se il salvataggio è riuscito, false se no.*/
+
 static bool saveRules(uint8_t ch1to4) {
-  int i = ch1to4 - 1;
+  int i = ch1to4 - 1; //numero di rele normalizzato per array
 
   // Salvataggio count + blocco regole
-  size_t w1 = prefs.putUChar(KEY_RC[i], ruleCount[i]);
-  size_t w2 = prefs.putBytes(KEY_RB[i], rules[i], sizeof(rules[i]));
+  //scrive quantee regole ha quel relee
+  size_t w1 = prefs.putUChar(KEY_RC[i], ruleCount[i]); //ad esempio in flash salva: rc2 =3
+  size_t w2 = prefs.putBytes(KEY_RB[i], rules[i], sizeof(rules[i]));//salva/scrive tutte le regole de rele struct RelayRuleBin
 
+  //controllo se il salvataggio è riuscito w1 == 1 - scrittura del count riuscita w2 == dimensione completa ||| scrittura del blocco riuscita.
   bool ok = (w1 == 1) && (w2 == sizeof(rules[i]));
-  DBGLN("[NVS] saveRules ch=%u count=%u w1=%u w2=%u ok=%u",
+  DBGLN("[SCHEDULAZIONE] REGOLE SALVATE RELE=%u N_REGOLE=%u REGOLA=%u byte scritti=%u ok=%u",
         ch1to4, ruleCount[i], (unsigned)w1, (unsigned)w2, (unsigned)ok);
 
-  return ok;
+  return ok; //ritorna ok per inviare ACK ok al master
 }
 
+//ricarica tutte le regole all'avvio (boot)
+//Legge dalla memoria permanente (NVS) tutte le schedulazioni dei relè e le rimette in RAM.
 static void loadRulesAll() {
   for (int i = 0; i < RELAY_COUNT; i++) {
     uint8_t c = prefs.getUChar(KEY_RC[i], 0);
@@ -318,85 +325,115 @@ static void loadRulesAll() {
       memset(rules[i], 0, sizeof(rules[i]));
       ruleCount[i] = 0;
     }
-    DBGLN("[NVS] loadRules ch=%d count=%u bytes=%u", i+1, ruleCount[i], (unsigned)n);
+    DBGLN("[SCHEDULAZIONE] CARICO REGOLE RELE=%d NREGOLE=%u bytes scritti=%u", i+1, ruleCount[i], (unsigned)n);
   }
 }
 
 // ===================== ESPNOW peers =====================
-static void ensureMasterPeer(uint8_t /*ch*/) {
-  if (!masterMacValid()) return;
+//Assicura che il MASTER sia registrato come “peer” ESP-NOW, così POWER può inviargli pacchetti.
+static void ensureMasterPeer(uint8_t /*ch*/) { //riceve ch “lo ricevo ma non mi serve”
+  if (!masterMacValid()) {  //controlla se il mac è valido
+    DBGLN("[ESPNOW] MAC MASTER NON VALIDO"); 
+    return;
+  }
 
+  //Crea la struttura peer ESP-NOW
   esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, MASTER_MAC, 6);
-  peer.channel = 0;
-  peer.encrypt = false;
+  memcpy(peer.peer_addr, MASTER_MAC, 6); //Copia dentro il MAC del master --AA:BB:CC:DD:EE:FF
+  peer.channel = 0; //imposta il canale, 0 dice: usa il canale corrente non forzarne uno fisso
+  //Se invece mettessi: peer.channel = 6; il peer funzionerebbe solo su canale 6.
+ 
+  peer.encrypt = false;// non usare cifratura per ESP-NOW
 
+  //Rimuove il peer se esiste già perche ESP-NOW non accetta duplicati 
   esp_now_del_peer(MASTER_MAC);
+    //e lo riaggiunge
   esp_err_t e = esp_now_add_peer(&peer);
 
+  //trasforma MAC in stringa:
   char macs[24]; macToStr(MASTER_MAC, macs, sizeof(macs));
-  DBGLN("[ESPNOW] ensureMasterPeer mac=%s add_peer=%d", macs, (int)e);
+  DBGLN("[ESPNOW -POWER] PEER AGGIUNGTO con mac=%s PEER=%d", macs, (int)e);
 }
 
+//invia ack di aggangio del canale da parte del peer al master se lo trova
 static void sendHelloAckToMaster(uint8_t ch, bool ok = true) {
-  if (!masterMacValid()) { DBGLN("[ESPNOW] sendHelloAck skipped (no master mac)"); return; }
+  if (!masterMacValid()) { DBGLN("[ESPNOW - POWER] Non posso inviare HelloAck skipped (non conosco il MAC del MASTER)"); return; }
 
   HelloAckPacket a;
-  a.type = PWR_HELLO_ACK_TYPE;
-  a.ch   = ch;
+  a.type = PWR_HELLO_ACK_TYPE; //tipo messaggio
+  a.ch   = ch;  //canale sintonizzato
   a.ok   = ok ? 1 : 0;
-  a.ms   = millis();
+  a.ms   = millis(); //timestamp
 
+  //Invia via ESP-NOW al master
   esp_err_t e = esp_now_send(MASTER_MAC, (uint8_t*)&a, sizeof(a));
-  DBGLN("[ESPNOW] TX HELLO_ACK ch=%u ok=%u -> %d", (unsigned)a.ch, (unsigned)a.ok, (int)e);
+  /*
+  MASTER_MAC → destinatario (MAC del master)
+  (uint8_t*)&a → i bytes del pacchetto (la struct vista come array di byte)
+  sizeof(a) → quanti byte inviare (dimensione della struct)
+  */
+  DBGLN("[ESPNOW - PORWER]  HELLO_ACK OK! ho mandato ACK sul CANALE=%u TUTTO BENE=%u -> %d", (unsigned)a.ch, (unsigned)a.ok, (int)e);
 }
 
+//Invia errore al master
 static void sendErrorToMaster(uint8_t code, uint8_t ch = 0, uint8_t extra = 0) {
-  if (!masterMacValid()) { DBGLN("[ESPNOW] sendError skipped (no master mac)"); return; }
+  if (!masterMacValid()) {     DBGLN("[ESPNOW] MAC MASTER NON VALIDO"); return; }
 
   PowerErrorPacket er;
-  er.type  = PWR_ERROR_TYPE;
+  er.type  = PWR_ERROR_TYPE; //tipo messaggio
   er.code  = code;
-  er.ch    = ch;
+  er.ch    = ch; //cabake
   er.extra = extra;
   er.ms    = millis();
 
+  //invia messaggio di errore al master :destinatario = MAC master, contenuto = struct er convertita in byte  - lunghezza = dimensione struct
   esp_err_t e = esp_now_send(MASTER_MAC, (uint8_t*)&er, sizeof(er));
-  DBGLN("[ESPNOW] TX ERROR code=%u ch=%u extra=%u -> %d",
+  DBGLN("[ESPNOW] TX ERROR CODICE=%u CANALE=%u extra=%u -> %d",
         (unsigned)code, (unsigned)ch, (unsigned)extra, (int)e);
 }
 
+//invio stato rele al master:
+/*
+quali relè sono ON/OFF
+se l’orario è valido
+perché si è riavviato
+timestamp
+*/
 static void sendStateToMaster() {
-  if (!masterMacValid()) { DBGLN("[ESPNOW] sendState skipped (no master mac)"); return; }
-
+  if (!masterMacValid()) { DBGLN("[ESPNOW] MAC MASTER NON VALIDO"); return; }
+//Crea il pacchetto STATE
   PowerStatePacket st;
-  st.type = PWR_STATE_TYPE;
-  st.relayMask = relayMask;
-  st.timeValid = timeValid ? 1 : 0;
-  st.resetReason = resetReasonCompact();
-  st.ms = millis();
+  st.type = PWR_STATE_TYPE; //tipo_messaggio 
+  st.relayMask = relayMask; //è il numero che contiene lo stato attuale dei relè.
+  st.timeValid = timeValid ? 1 : 0; //ho l'orario sincronizzato oppure no?
+  st.resetReason = resetReasonCompact(); //Inserisce motivo reset
+  st.ms = millis(); //timestamp
 
+  //INVIO AL MASTER
   esp_err_t e = esp_now_send(MASTER_MAC, (uint8_t*)&st, sizeof(st));
-  DBGLN("[ESPNOW] TX STATE mask=%u timeValid=%u -> %d",
+  DBGLN("[ESPNOW - INVIO STATO]  stato_relay=%u timeValid=%u -> %d",
         (unsigned)st.relayMask, (unsigned)st.timeValid, (int)e);
 }
 
+//Dice al Master: Ho ricevuto le schedulazioni per il relè X. Le ho salvate (oppure no).
+//È l’ACK delle RULES (SCHEDULAZIONI)=.
 static void sendScheduleAckToMaster(uint8_t ch1to4, uint8_t count, bool ok = true) {
-  if (!masterMacValid()) { DBGLN("[ESPNOW] sendAck skipped (no master mac)"); return; }
+  if (!masterMacValid()) { DBGLN("[ESPNOW] MAC MASTER NON VALIDO)"); return; }
   if (ch1to4 < 1 || ch1to4 > RELAY_COUNT) return;
 
   PowerScheduleAckPacket ack;
-  ack.type = PWR_SCHED_ACK_TYPE;
-  ack.ch = ch1to4;
-  ack.ok = ok ? 1 : 0;
-  ack.count = (count > 10) ? 10 : count;
-  ack.ms = millis();
+  ack.type = PWR_SCHED_ACK_TYPE;  //tipo
+  ack.ch = ch1to4;                //quale rele 1 ... 4 
+  ack.ok = ok ? 1 : 0;          // successo o fallimento
+  ack.count = (count > 10) ? 10 : count;  //quante regole
+  ack.ms = millis();  //timestamp
 
   esp_err_t e = esp_now_send(MASTER_MAC, (uint8_t*)&ack, sizeof(ack));
-  DBGLN("[ESPNOW] TX ACK ch=%u ok=%u count=%u -> %d",
+  DBGLN("[ESPNOW] HO SALVATO LA SCHEDULAZIONE CANALE=%u ok=%u count=%u -> %d",
         (unsigned)ack.ch, (unsigned)ack.ok, (unsigned)ack.count, (int)e);
 }
 
+//avvisa il MASTER che una schedulazione è stata davvero eseguita
 static void sendExecutedToMaster(uint8_t ch1to4, bool on) {
   if (!masterMacValid()) return;
   if (ch1to4 < 1 || ch1to4 > RELAY_COUNT) return;
@@ -410,7 +447,7 @@ static void sendExecutedToMaster(uint8_t ch1to4, bool on) {
   ex.ms = millis();
 
   esp_err_t e = esp_now_send(MASTER_MAC, (uint8_t*)&ex, sizeof(ex));
-  DBGLN("[ESPNOW] TX EXEC ch=%u %s min=%u wd=%u -> %d",
+  DBGLN("[ESPNOW] ESEGUITO canale=%u %s min=%u wd=%u -> %d",
         (unsigned)ex.ch, onOff(on), (unsigned)ex.minuteOfDay, (unsigned)ex.weekdayMon0, (int)e);
 }
 
